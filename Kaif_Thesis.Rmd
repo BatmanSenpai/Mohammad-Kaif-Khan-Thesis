@@ -1,0 +1,1949 @@
+---
+title: "Lp(a) Analysis"
+author: "Kaif"
+date: "2026-05-12"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    fig_width: 6
+    fig_height: 4
+---
+
+# Knit
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Setup and Inclusion funnel
+
+(up to Lp(a); age filter deferred until AFTER the outlier check)
+
+```{r}
+# Load required libraries
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(gtsummary)
+library(gt)
+library(car)
+library(broom)
+library(MASS)
+library(nnet)
+library(mediation)
+library(flextable)
+library(officer)
+library(reshape2)
+library(purrr)
+library(GGally)
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(rsvg)
+library(glue)
+library(scales)
+
+# Set working directory and load raw data
+setwd("K:/KINDER-FSCM/Forschung Lehre/Hand aufs Herz/Analysis/15062026_output_base")
+df_raw <- read.csv("df_all_percentiles.csv")  
+
+# Process participant inclusion funnel
+n_total <- nrow(df_raw)                        
+
+df <- df_raw %>% filter(blood_tested != 0)           
+n_blood <- nrow(df)
+
+df <- df %>% filter(!is.na(blood_value_lpa))        
+n_lpa <- nrow(df)
+
+df <- df %>% filter(age >= 9 & age <= 18)            
+n_age <- nrow(df)
+
+df <- df %>% filter(sex != "Diverse")                
+n_sex <- nrow(df)
+
+n_final <- nrow(df)                                  
+
+cat("Total in raw dataset:        ", n_total, "\n")
+cat("  -> blood tested:           ", n_blood, "  (dropped ", n_total - n_blood, ")\n", sep = "")
+cat("  -> valid Lp(a):            ", n_lpa,   "  (dropped ", n_blood - n_lpa,  ")\n", sep = "")
+cat("  -> age 9-18:               ", n_age,   "  (dropped ", n_lpa   - n_age,  ")\n", sep = "")
+cat("  -> sex Male/Female:        ", n_sex,   "  (dropped ", n_age   - n_sex,  ")\n", sep = "")
+cat("FINAL analysis sample:       ", n_final, "\n")
+
+# Setup housekeeping and select required columns
+df$id <- as.factor(df$id)
+df1_backup <- df
+
+df <- df %>% dplyr::select(
+  "id", "sex", "who_bmi", "who_bmi_for_age_z", "age",
+  "fam_heart_dis", "fam_heart_attack", "fam_young_heart_attack",
+  "phy_act", "ern_mds", "time_screen_weekday", "time_screen_weekend",
+  "blood_value_lpa", "ht",
+  "time_sleep_weekday", "time_sleep_weekend",
+  "bp_sys", "bp_dia", "systolic_bp_percentile", "diastolic_bp_percentile"
+)
+
+# Combine family history variables into a single feature
+make_famhx <- function(d) {
+  d %>% mutate(card_risk_fam_combined = case_when(
+    fam_heart_dis == "Yes" | fam_heart_attack == "Yes" | fam_young_heart_attack == "Yes" ~ "Yes",
+    fam_heart_dis == "No"  & fam_heart_attack == "No"  ~ "No",
+    TRUE ~ NA_character_))
+}
+df     <- make_famhx(df)
+df_raw <- make_famhx(df_raw)
+
+cat("\n--- Family history (card_risk_fam_combined) ---\n")
+table(df$card_risk_fam_combined, useNA = "ifany")
+
+# Perform bias check comparing included versus excluded participants
+included_ids <- df$id
+
+compare_df <- df_raw %>%
+  mutate(
+    id     = as.factor(id),
+    status = if_else(id %in% included_ids, "Included", "Excluded"),
+    status = factor(status, levels = c("Included", "Excluded"))
+  )
+
+tab_bias <- compare_df %>%
+  dplyr::select(age, sex, who_bmi, bp_sys, bp_dia, status) %>%
+  tbl_summary(
+    by        = status,
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    digits    = all_continuous() ~ 1,
+    label = list(
+      age     ~ "Age (years)",
+      sex     ~ "Sex",
+      who_bmi ~ "WHO BMI category",
+      bp_sys  ~ "Systolic BP (mmHg)",
+      bp_dia  ~ "Diastolic BP (mmHg)"
+    ),
+    missing_text = "Missing"
+  ) %>%
+  add_p() %>%                        
+  add_overall() %>%
+  modify_header(label = "**Characteristic**") %>%
+  modify_caption("**Supplementary Table. Included vs Excluded Participants**") %>%
+  bold_labels()
+
+tab_bias
+```
+
+# Lifestyle Score
+
+Four components, each scored 0–1.
+
+```{r}
+# Inspect raw category labels for sleep
+table(df$time_sleep_weekday, useNA = "ifany")
+table(df$time_sleep_weekend, useNA = "ifany")
+
+# Clean text labels and strip hours
+df$time_sleep_weekday <- as.factor(df$time_sleep_weekday)
+df$time_sleep_weekend <- as.factor(df$time_sleep_weekend)
+
+df <- df %>% mutate(time_sleep_weekday = str_remove_all(time_sleep_weekday, " hours"))
+df <- df %>% mutate(time_sleep_weekend = str_remove_all(time_sleep_weekend, " hours"))
+
+df <- df %>% mutate(time_screen_weekend = str_replace(time_screen_weekend, "More than 8 hours", "9"))
+df <- df %>% mutate(time_screen_weekend = str_remove_all(time_screen_weekend, " hours"))
+df <- df %>% mutate(time_screen_weekend = str_remove_all(time_screen_weekend, " hour"))
+
+df <- df %>% mutate(time_screen_weekday = str_replace(time_screen_weekday, "More than 8 hours", "9"))
+df <- df %>% mutate(time_screen_weekday = str_remove_all(time_screen_weekday, " hours"))
+df <- df %>% mutate(time_screen_weekday = str_remove_all(time_screen_weekday, " hour"))
+
+# Map sleep bands to numeric hours
+sleep_map <- function(x) {
+  case_when(
+    x == "< 5"                 ~ 4.5,
+    x == "5-6"                 ~ 5.5,
+    x == "6-7"                 ~ 6.5,
+    x == "7-8"                 ~ 7.5,
+    x == "8-9"                 ~ 8.5,
+    grepl(">|9|more", x, ignore.case = TRUE) ~ 9.5,
+    TRUE                       ~ NA_real_
+  )
+}
+
+df$time_sleep_weekday <- sleep_map(df$time_sleep_weekday)
+df$time_sleep_weekend <- sleep_map(df$time_sleep_weekend)
+
+# Convert variables to numeric
+df$time_screen_weekday <- as.numeric(df$time_screen_weekday)
+df$time_screen_weekend <- as.numeric(df$time_screen_weekend)
+df$time_sleep_weekday  <- as.numeric(df$time_sleep_weekday)
+df$time_sleep_weekend  <- as.numeric(df$time_sleep_weekend)
+
+# Calculate weighted weekday/weekend averages
+df <- df %>%
+  mutate(
+    score_screen = case_when(
+      !is.na(time_screen_weekday) & !is.na(time_screen_weekend) ~ (time_screen_weekday * 5 + time_screen_weekend * 2) / 7,
+      !is.na(time_screen_weekday) & is.na(time_screen_weekend)  ~ time_screen_weekday,
+      is.na(time_screen_weekday) & !is.na(time_screen_weekend)  ~ time_screen_weekend,
+      TRUE ~ NA_real_
+    ),
+    score_sleep = case_when(
+      !is.na(time_sleep_weekday) & !is.na(time_sleep_weekend) ~ (time_sleep_weekday * 5 + time_sleep_weekend * 2) / 7,
+      !is.na(time_sleep_weekday) & is.na(time_sleep_weekend)  ~ time_sleep_weekday,
+      is.na(time_sleep_weekday) & !is.na(time_sleep_weekend)  ~ time_sleep_weekend,
+      TRUE ~ NA_real_
+    )
+  )
+
+table(df$score_screen)
+table(df$score_sleep)
+
+# Create component flag for screen time risk
+df$screen <- ifelse((df$age <= 11 & df$score_screen >= 1), 1,
+             ifelse((df$age >= 12 & df$score_screen >= 3), 1, 0))
+
+# Create component flag for sleep duration risk
+df$sleep  <- ifelse((df$age <= 12 & df$score_sleep < 9), 1,
+             ifelse((df$age >= 13 & df$score_sleep < 8), 1, 0))
+
+table(df$screen, df$score_screen)
+table(df$sleep,  df$score_sleep)
+
+# Create component flag for Mediterranean diet score
+table(df$ern_mds)
+df$ern_mds_score <- case_when(
+  is.na(df$ern_mds)                                             ~ NA_real_,
+  grepl("<=\\s*3|≤\\s*3|\\b3\\b.*less|low", df$ern_mds, ignore.case = TRUE) ~ 1,
+  TRUE                                                          ~ 0
+)
+
+table(df$ern_mds_score, df$ern_mds, useNA = "always")
+
+# Create component flag for physical activity
+table(df$phy_act, useNA = "always")
+
+df$phy_act_score <- case_when(
+  is.na(df$phy_act) ~ NA_real_,
+  df$phy_act == 0   ~ 1,
+  TRUE              ~ 0
+)
+
+table(df$phy_act_score, df$phy_act, useNA = "always")
+
+# Calculate composite lifestyle score and categories
+df$comp_score <- rowSums(cbind(df$screen, df$sleep, df$ern_mds_score, df$phy_act_score),
+                         na.rm = FALSE)
+
+df$comp_score_f <- factor(df$comp_score)
+
+df$comp_score_cat <- factor(df$comp_score,
+                            levels = 0:4,
+                            labels = c("0 (best)", "1", "2", "3", "4 (worst)"),
+                            ordered = TRUE)
+
+table(df$comp_score_cat, useNA = "always")
+table(df$comp_score,     useNA = "always")
+
+# Create lifestyle tiers
+df <- df %>%
+  mutate(lifestyle_tier = case_when(
+           comp_score <= 1 ~ "Ideal (0-1)",
+           comp_score == 2 ~ "Moderate (2)",
+           comp_score >= 3 ~ "Poor (3-4)",
+           TRUE            ~ NA_character_
+          ),
+         lifestyle_tier = factor(lifestyle_tier,
+                                 levels = c("Ideal (0-1)", "Moderate (2)", "Poor (3-4)")))
+
+# Categorize blood pressure
+elevated_levels <- c("P90", "P95", "P97", "P99")
+normal_levels   <- c("<P50", "P50", "P75")
+
+df <- df %>%
+  mutate(bp_elevated = case_when(
+    systolic_bp_percentile  %in% elevated_levels ~ "Elevated",
+    diastolic_bp_percentile %in% elevated_levels ~ "Elevated",
+    systolic_bp_percentile  %in% normal_levels &
+      diastolic_bp_percentile %in% normal_levels ~ "Normal",
+    TRUE ~ NA_character_
+  ))
+
+table(df$bp_elevated, useNA = "ifany")
+
+# Prepare regression dataset and log transform Lp(a)
+df <- df %>%
+  mutate(
+    log_lpa = ifelse(blood_value_lpa == 0, NA_real_, log(blood_value_lpa)),
+    sex     = factor(sex)
+  )
+
+vars_all <- c("bp_sys", "bp_dia", "systolic_bp_percentile", "diastolic_bp_percentile",
+              "log_lpa", "blood_value_lpa", "age", "sex", "who_bmi_for_age_z", 
+              "card_risk_fam_combined", "comp_score", "comp_score_f", "lifestyle_tier",
+              "phy_act_score", "ern_mds_score", "screen", "sleep", "ht")
+
+missing_summary <- df %>%
+  dplyr::select(all_of(vars_all)) %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  mutate(n_total = nrow(df),
+         pct_missing = round(100 * n_missing / n_total, 1)) %>%
+  arrange(desc(n_missing))
+
+df_reg <- df[complete.cases(df[vars_all]), ]
+
+df_reg$lifestyle_tier <- factor(
+  df_reg$lifestyle_tier,
+  levels = c("Ideal (0-1)", "Moderate (2)", "Poor (3-4)")
+)
+df_reg$screen        <- factor(df_reg$screen)
+df_reg$sleep         <- factor(df_reg$sleep)
+df_reg$ern_mds_score <- factor(df_reg$ern_mds_score)
+
+cat("Total rows in original dataset:", nrow(df), "\n")
+cat("Unified complete cases (df_reg) for ALL models:", nrow(df_reg), "\n")
+cat("Dropped for missingness:", nrow(df) - nrow(df_reg), "\n")
+
+# Fit linear models using composite score factors
+m_factor_sys <- lm(bp_sys ~ comp_score_f + age + sex + who_bmi_for_age_z, data = df_reg)
+m_factor_dia <- lm(bp_dia ~ comp_score_f + age + sex + who_bmi_for_age_z, data = df_reg)
+
+summary(m_factor_sys)
+summary(m_factor_dia)
+
+# Perform data integrity checks
+cat("Duplicate IDs in raw:", sum(duplicated(df_raw$id)), "\n")
+
+cat("Distinct ages:", n_distinct(df$age), " range:", range(df$age, na.rm=TRUE), "\n")
+
+df %>% summarise(
+  bp_sys_le_dia = sum(bp_sys <= bp_dia, na.rm = TRUE),
+  sbp_out       = sum(bp_sys < 60  | bp_sys > 200, na.rm = TRUE),
+  dbp_out       = sum(bp_dia < 30  | bp_dia > 130, na.rm = TRUE),
+  bmiz_out      = sum(abs(who_bmi_for_age_z) > 5, na.rm = TRUE),
+  lpa_zero      = sum(blood_value_lpa == 0, na.rm = TRUE),
+  lpa_max       = max(blood_value_lpa, na.rm = TRUE)
+)
+
+table(df$age, df$screen)
+table(df$age, df$sleep)
+
+cat("screen: weekday-only", sum(!is.na(df$time_screen_weekday) & is.na(df$time_screen_weekend)),
+    " weekend-only", sum(is.na(df$time_screen_weekday) & !is.na(df$time_screen_weekend)), "\n")
+
+df %>% summarise(across(c(screen, sleep, ern_mds_score, phy_act_score),
+                        ~ sprintf("%d (%.1f%%)", sum(.x == 1, na.rm=TRUE),
+                                  100*mean(.x == 1, na.rm=TRUE))))
+
+stopifnot(!any(is.na(df$score_sleep)  & !is.na(df$time_sleep_weekday)))
+stopifnot(!any(is.na(df$score_screen) & !is.na(df$time_screen_weekday)))
+
+table(df_raw$sex, useNA = "ifany")
+
+# Build final derived outcomes on the regression dataset
+percentile_levels <- c("<P50","P50","P75","P90","P95","P97","P99")
+elev <- c("P90","P95","P97","P99")
+
+stopifnot(length(setdiff(na.omit(unique(df_reg$systolic_bp_percentile)),  percentile_levels)) == 0)
+stopifnot(length(setdiff(na.omit(unique(df_reg$diastolic_bp_percentile)), percentile_levels)) == 0)
+
+df_reg <- df_reg %>%
+  mutate(
+    sys_pctl_ord = factor(systolic_bp_percentile,  levels = percentile_levels, ordered = TRUE),
+    dia_pctl_ord = factor(diastolic_bp_percentile, levels = percentile_levels, ordered = TRUE),
+
+    sys_high90 = case_when(
+      is.na(systolic_bp_percentile) | is.na(bp_sys)   ~ NA_real_,
+      age <  13 & systolic_bp_percentile %in% elev    ~ 1,
+      age >= 13 & bp_sys >= 120                      ~ 1,
+      TRUE                                           ~ 0),
+    dia_high90 = case_when(
+      is.na(diastolic_bp_percentile) | is.na(bp_dia)  ~ NA_real_,
+      age <  13 & diastolic_bp_percentile %in% elev   ~ 1,
+      age >= 13 & bp_dia >= 80                       ~ 1,
+      TRUE                                           ~ 0),
+
+    sys_bp_cat3 = factor(case_when(
+      systolic_bp_percentile %in% c("<P50","P50") ~ "<P75",
+      systolic_bp_percentile == "P75"             ~ "P75-P90",
+      systolic_bp_percentile %in% elev            ~ ">=P90"),
+      levels = c("<P75","P75-P90",">=P90")),
+    dia_bp_cat3 = factor(case_when(
+      diastolic_bp_percentile %in% c("<P50","P50") ~ "<P75",
+      diastolic_bp_percentile == "P75"             ~ "P75-P90",
+      diastolic_bp_percentile %in% elev            ~ ">=P90"),
+      levels = c("<P75","P75-P90",">=P90")),
+
+    lpa_clinical_risk = factor(
+      ifelse(blood_value_lpa >= 75, "High Risk (>=75)", "Normal (<75)"),
+      levels = c("Normal (<75)", "High Risk (>=75)")),
+
+    lifestyle_tier         = relevel(factor(lifestyle_tier), ref = "Ideal (0-1)"),
+    card_risk_fam_combined = relevel(factor(card_risk_fam_combined), ref = "No")
+  )
+
+table(df_reg$sys_high90, useNA = "ifany")
+table(df_reg$lifestyle_tier, df_reg$lpa_clinical_risk)
+
+```
+
+# Effects Model
+
+Regression models
+
+```{r}
+# Define primary and secondary covariate sets
+COV       <- "age + sex + who_bmi_for_age_z"        
+COV_NOBMI <- "age + sex"                            
+EXTRA     <- "log_lpa + card_risk_fam_combined"     
+
+fit <- function(outcome, rhs, family = NULL) {
+  f <- as.formula(paste(outcome, "~", rhs))
+  if (is.null(family)) lm(f, data = df_reg) else glm(f, data = df_reg, family = family)
+}
+
+# Linear models for measured blood pressure
+m1_sys <- fit("bp_sys", paste("log_lpa", COV, sep = " + "))
+m1_dia <- fit("bp_dia", paste("log_lpa", COV, sep = " + "))
+m2_sys <- fit("bp_sys", paste("log_lpa", COV, "comp_score + card_risk_fam_combined", sep = " + "))
+m2_dia <- fit("bp_dia", paste("log_lpa", COV, "comp_score + card_risk_fam_combined", sep = " + "))
+m3_sys <- fit("bp_sys", paste("log_lpa", COV, "phy_act_score + ern_mds_score + screen + sleep + card_risk_fam_combined", sep = " + "))
+m3_dia <- fit("bp_dia", paste("log_lpa", COV, "phy_act_score + ern_mds_score + screen + sleep + card_risk_fam_combined", sep = " + "))
+m4_sys <- fit("bp_sys", paste("log_lpa * card_risk_fam_combined", COV, "comp_score", sep = " + "))
+m4_dia <- fit("bp_dia", paste("log_lpa * card_risk_fam_combined", COV, "comp_score", sep = " + "))
+
+sys_main    <- fit("bp_sys", paste("lifestyle_tier", EXTRA, COV, sep = " + "))
+dia_main    <- fit("bp_dia", paste("lifestyle_tier", EXTRA, COV, sep = " + "))
+sys_lpa_int <- fit("bp_sys", paste("lifestyle_tier * log_lpa + card_risk_fam_combined", COV, sep = " + "))
+dia_lpa_int <- fit("bp_dia", paste("lifestyle_tier * log_lpa + card_risk_fam_combined", COV, sep = " + "))
+sys_fam_int <- fit("bp_sys", paste("lifestyle_tier * card_risk_fam_combined + log_lpa", COV, sep = " + "))
+dia_fam_int <- fit("bp_dia", paste("lifestyle_tier * card_risk_fam_combined + log_lpa", COV, sep = " + "))
+
+# BMI-free versions for total effect of lifestyle
+sys_main_noBMI <- fit("bp_sys", paste("lifestyle_tier", EXTRA, COV_NOBMI, sep = " + "))
+dia_main_noBMI <- fit("bp_dia", paste("lifestyle_tier", EXTRA, COV_NOBMI, sep = " + "))
+
+# Height-adjusted parallel set of models
+for (nm in c("m1_sys","m1_dia","m2_sys","m2_dia","m3_sys","m3_dia","m4_sys","m4_dia",
+             "sys_main","dia_main","sys_lpa_int","dia_lpa_int","sys_fam_int","dia_fam_int")) {
+  assign(paste0(nm, "_ht"), update(get(nm), . ~ . + ht))
+}
+stopifnot(nobs(sys_main) == nobs(sys_main_ht))   
+
+# Logistic models using harmonized covariate set
+sys90_main <- fit("sys_high90", paste("lifestyle_tier", EXTRA, COV, sep = " + "), family = binomial)
+dia90_main <- fit("dia_high90", paste("lifestyle_tier", EXTRA, COV, sep = " + "), family = binomial)
+sys90_lpa  <- fit("sys_high90", paste("lifestyle_tier * log_lpa + card_risk_fam_combined", COV, sep = " + "), family = binomial)
+dia90_lpa  <- fit("dia_high90", paste("lifestyle_tier * log_lpa + card_risk_fam_combined", COV, sep = " + "), family = binomial)
+sys90_fam  <- fit("sys_high90", paste("lifestyle_tier * card_risk_fam_combined + log_lpa", COV, sep = " + "), family = binomial)
+dia90_fam  <- fit("dia_high90", paste("lifestyle_tier * card_risk_fam_combined + log_lpa", COV, sep = " + "), family = binomial)
+
+# Multinomial models for BP categories
+mn <- function(outcome, rhs) nnet::multinom(as.formula(paste(outcome, "~", rhs)),
+                                            data = df_reg, trace = FALSE)
+sys_main_cat    <- mn("sys_bp_cat3", paste("lifestyle_tier", EXTRA, COV, sep = " + "))
+dia_main_cat    <- mn("dia_bp_cat3", paste("lifestyle_tier", EXTRA, COV, sep = " + "))
+sys_lpa_int_cat <- mn("sys_bp_cat3", paste("lifestyle_tier * log_lpa + card_risk_fam_combined", COV, sep = " + "))
+dia_lpa_int_cat <- mn("dia_bp_cat3", paste("lifestyle_tier * log_lpa + card_risk_fam_combined", COV, sep = " + "))
+sys_fam_int_cat <- mn("sys_bp_cat3", paste("lifestyle_tier * card_risk_fam_combined + log_lpa", COV, sep = " + "))
+dia_fam_int_cat <- mn("dia_bp_cat3", paste("lifestyle_tier * card_risk_fam_combined + log_lpa", COV, sep = " + "))
+
+# Ordinal regression models
+m_pctl_sys <- MASS::polr(as.formula(paste("sys_pctl_ord ~ comp_score_f", EXTRA, COV, sep = " + ")),
+                         data = df_reg, Hess = TRUE)
+m_pctl_dia <- MASS::polr(as.formula(paste("dia_pctl_ord ~ comp_score_f", EXTRA, COV, sep = " + ")),
+                         data = df_reg, Hess = TRUE)
+
+# Joint interaction tests using nested F-tests
+int_tests <- bind_rows(
+  broom::tidy(anova(sys_main, sys_lpa_int)) %>% mutate(Test = "Systolic: Lifestyle × Lp(a)"),
+  broom::tidy(anova(dia_main, dia_lpa_int)) %>% mutate(Test = "Diastolic: Lifestyle × Lp(a)"),
+  broom::tidy(anova(sys_main, sys_fam_int)) %>% mutate(Test = "Systolic: Lifestyle × FamHx"),
+  broom::tidy(anova(dia_main, dia_fam_int)) %>% mutate(Test = "Diastolic: Lifestyle × FamHx")
+) %>% filter(!is.na(statistic)) %>%
+  transmute(Test, df, `Sum Sq` = round(sumsq, 2), `F statistic` = round(statistic, 2),
+            `p-value` = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value)))
+
+ft_int_tests <- flextable(int_tests) %>%
+  set_caption("Joint tests of effect modification (nested F-tests)") %>% autofit()
+ft_int_tests
+
+# Calculate minimum detectable interaction effects
+mde <- function(model, label) {
+  s <- summary(model)$coefficients
+  rows <- grep(":", rownames(s), value = TRUE)
+  if (!length(rows)) return(NULL)
+  data.frame(Model = label, Term = rows, SE = round(s[rows,"Std. Error"], 3),
+             `MDE (80% power)` = round(2.8 * s[rows,"Std. Error"], 2),
+             check.names = FALSE, row.names = NULL)
+}
+
+mde_tab <- bind_rows(mde(sys_fam_int, "Sys: Lifestyle × FamHx"),
+                     mde(dia_fam_int, "Dia: Lifestyle × FamHx"),
+                     mde(sys_lpa_int, "Sys: Lifestyle × Lp(a)"),
+                     mde(dia_lpa_int, "Dia: Lifestyle × Lp(a)"))
+
+ft_mde <- flextable(mde_tab) %>%
+  set_caption("Minimum detectable interaction effect (mmHg), 80% power, α = 0.05") %>% autofit()
+ft_mde
+```
+
+# Descriptive BP by age, regression dataset (df_reg), and main-effects models
+
+```{r}
+# Calculate descriptive statistics for systolic blood pressure by age
+bp_age <- df %>%
+  group_by(age) %>%
+  summarise(
+    N        = sum(!is.na(bp_sys)),
+    mean    = round(mean(bp_sys, na.rm = TRUE), 2),
+    sd      = round(sd(bp_sys,   na.rm = TRUE), 2),
+    se      = round(sd / sqrt(N), 2),
+    min     = round(min(bp_sys,  na.rm = TRUE), 2),
+    max     = round(max(bp_sys,  na.rm = TRUE), 2),
+    IQR     = round(IQR(bp_sys,  na.rm = TRUE), 2),
+    CI_low  = round(mean - qnorm(.975) * se, 2),
+    CI_high = round(mean + qnorm(.975) * se, 2),
+    .groups = "drop"
+  )
+
+bp_age
+```
+
+
+# Sensitivity Analyses
+
+```{r}
+# Sensitivity A: Binary Lp(a) Cutoff
+sys_sens_bin_main <- fit("bp_sys", paste("lifestyle_tier + lpa_clinical_risk + card_risk_fam_combined", COV, sep = " + "))
+sys_sens_bin_int  <- fit("bp_sys", paste("lifestyle_tier * lpa_clinical_risk + card_risk_fam_combined", COV, sep = " + "))
+
+dia_sens_bin_main <- fit("bp_dia", paste("lifestyle_tier + lpa_clinical_risk + card_risk_fam_combined", COV, sep = " + "))
+dia_sens_bin_int  <- fit("bp_dia", paste("lifestyle_tier * lpa_clinical_risk + card_risk_fam_combined", COV, sep = " + "))
+
+# Sensitivity B: Continuous Lifestyle Score
+sys_sens_cont_main    <- fit("bp_sys", paste("comp_score", EXTRA, COV, sep = " + "))
+sys_sens_cont_lpa_int <- fit("bp_sys", paste("comp_score * log_lpa + card_risk_fam_combined", COV, sep = " + "))
+sys_sens_cont_fam_int <- fit("bp_sys", paste("comp_score * card_risk_fam_combined + log_lpa", COV, sep = " + "))
+
+dia_sens_cont_main    <- fit("bp_dia", paste("comp_score", EXTRA, COV, sep = " + "))
+dia_sens_cont_lpa_int <- fit("bp_dia", paste("comp_score * log_lpa + card_risk_fam_combined", COV, sep = " + "))
+dia_sens_cont_fam_int <- fit("bp_dia", paste("comp_score * card_risk_fam_combined + log_lpa", COV, sep = " + "))
+
+# Build and display formatted sensitivity table
+sens_tests <- bind_rows(
+  broom::tidy(anova(sys_sens_bin_main, sys_sens_bin_int)) %>% mutate(Test = "Systolic: Binary Lp(a) Interaction"),
+  broom::tidy(anova(dia_sens_bin_main, dia_sens_bin_int)) %>% mutate(Test = "Diastolic: Binary Lp(a) Interaction"),
+  broom::tidy(anova(sys_sens_cont_main, sys_sens_cont_lpa_int)) %>% mutate(Test = "Systolic: Cont Lifestyle × Lp(a)"),
+  broom::tidy(anova(dia_sens_cont_main, dia_sens_cont_lpa_int)) %>% mutate(Test = "Diastolic: Cont Lifestyle × Lp(a)"),
+  broom::tidy(anova(sys_sens_cont_main, sys_sens_cont_fam_int)) %>% mutate(Test = "Systolic: Cont Lifestyle × FamHx"),
+  broom::tidy(anova(dia_sens_cont_main, dia_sens_cont_fam_int)) %>% mutate(Test = "Diastolic: Cont Lifestyle × FamHx")
+) %>% 
+  filter(!is.na(statistic)) %>%
+  transmute(Test, df, `Sum Sq` = round(sumsq, 2), `F statistic` = round(statistic, 2),
+            `p-value` = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value)))
+
+ft_sens_tests <- flextable(sens_tests) %>%
+  set_caption("Sensitivity Analyses: Effect Modification Models (ANOVA)") %>% 
+  autofit()
+
+ft_sens_tests
+```
+
+
+# Model Diagnostics
+
+```{r fig.width=12, fig.height=6}
+# Calculate Variance Inflation Factors for main-effects model
+vif_sys <- car::vif(sys_main)
+
+ft_vif <- as.data.frame(vif_sys) %>%
+  tibble::rownames_to_column("Predictor") %>%
+  flextable() %>%
+  set_caption("Variance Inflation Factors (Main-Effects Model)") %>%
+  autofit()
+
+ft_vif
+
+# Create diagnostic plots for model residuals
+diag_data <- broom::augment(sys_main)
+
+# Residuals vs Fitted plot to check for homoscedasticity
+p_resid_fit <- ggplot(diag_data, aes(x = .fitted, y = .resid)) +
+  geom_point(alpha = 0.5, color = "#2166AC") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 1) +
+  geom_smooth(method = "loess", se = FALSE, color = "black") +
+  theme_minimal(base_size = 14) +
+  labs(title = "Residuals vs Fitted Values",
+       subtitle = "Checking for Homoscedasticity",
+       x = "Fitted Values (Predicted Systolic BP)",
+       y = "Residuals")
+
+# Normal Q-Q plot to check normality of residuals
+p_qq <- ggplot(diag_data, aes(sample = .std.resid)) +
+  stat_qq(alpha = 0.5, color = "#B2182B") +
+  stat_qq_line(color = "black", linetype = "dashed", linewidth = 1) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Normal Q-Q Plot",
+       subtitle = "Checking Normality of Residuals",
+       x = "Theoretical Quantiles",
+       y = "Standardized Residuals")
+
+p_resid_fit
+p_qq
+
+```
+
+# Mediation analysis Poor lifestyle -\> BMI -\> Blood pressure
+
+```{r}
+# Create binary lifestyle indicator for poor tier vs ideal/moderate
+df_reg$lifestyle_poor <- ifelse(df_reg$lifestyle_tier == "Poor (3-4)", 1, 0)
+
+# Filter dataset for complete cases required by mediation models
+med_vars <- c("bp_sys", "bp_dia", "who_bmi_for_age_z", "lifestyle_poor", "log_lpa", "age", "sex")
+df_med <- df_reg[complete.cases(df_reg[med_vars]), ]
+
+# Fit the a-path model for lifestyle predicting the mediator (BMI)
+model_a <- lm(
+  who_bmi_for_age_z ~ lifestyle_poor + log_lpa + age + sex,
+  data = df_med
+)
+
+# Fit outcome models including both lifestyle and the BMI mediator
+sys_med <- lm(
+  bp_sys ~ lifestyle_poor + who_bmi_for_age_z + log_lpa + age + sex,
+  data = df_med
+)
+
+dia_med <- lm(
+  bp_dia ~ lifestyle_poor + who_bmi_for_age_z + log_lpa + age + sex,
+  data = df_med
+)
+
+# Run bootstrapped mediation tests
+set.seed(123)   
+
+med_sys <- mediate(
+  model.m  = model_a,
+  model.y  = sys_med,
+  treat    = "lifestyle_poor",
+  mediator = "who_bmi_for_age_z",
+  boot     = TRUE,
+  sims     = 1000
+)
+
+med_dia <- mediate(
+  model.m  = model_a,
+  model.y  = dia_med,
+  treat    = "lifestyle_poor",
+  mediator = "who_bmi_for_age_z",
+  boot     = TRUE,
+  sims     = 1000
+)
+
+summary(med_sys)
+summary(med_dia)
+
+# Extract path coefficients for analysis and reporting
+paths <- list(
+  A = tidy(model_a) %>% filter(term == "lifestyle_poor"),
+
+  SYS_total = tidy(
+    lm(bp_sys ~ lifestyle_poor + log_lpa + age + sex,
+       data = df_med)
+  ) %>% filter(term == "lifestyle_poor"),
+
+  SYS_direct = tidy(sys_med) %>% filter(term == "lifestyle_poor"),
+  SYS_mediator = tidy(sys_med) %>% filter(term == "who_bmi_for_age_z"),
+
+  DIA_total = tidy(
+    lm(bp_dia ~ lifestyle_poor + log_lpa + age + sex,
+       data = df_med)
+  ) %>% filter(term == "lifestyle_poor"),
+
+  DIA_direct = tidy(dia_med) %>% filter(term == "lifestyle_poor"),
+  DIA_mediator = tidy(dia_med) %>% filter(term == "who_bmi_for_age_z")
+)
+
+paths
+
+# Build and display formatted mediation table
+ft_mediation <- bind_rows(paths, .id = "Path") %>%
+  dplyr::select(Path, term, estimate, std.error, statistic, p.value) %>%
+  mutate(across(c(estimate, std.error, statistic), ~round(.x, 3)),
+         p.value = ifelse(as.numeric(p.value) < 0.001, "<0.001", sprintf("%.3f", as.numeric(p.value)))) %>%
+  flextable() %>%
+  set_caption("Mediation Analysis Paths (Lifestyle -> BMI -> BP)") %>%
+  autofit()
+
+ft_mediation
+```
+
+# BP \>= 90th percentile (binary outcomes) logistic models + odds-ratio forest plot
+
+```{r fig.width=12, fig.height=8}
+# Extract and combine main effects odds ratios for binary BP outcomes
+main90_df <- bind_rows(
+  tidy(sys90_main, conf.int = TRUE, exponentiate = TRUE) %>%
+    mutate(outcome = "Systolic BP >=90th percentile",  analysis = "Main effects"),
+  tidy(dia90_main, conf.int = TRUE, exponentiate = TRUE) %>%
+    mutate(outcome = "Diastolic BP >=90th percentile", analysis = "Main effects")
+)
+
+# Extract and combine interaction effects odds ratios
+int90_df <- bind_rows(
+  tidy(sys90_lpa, conf.int = TRUE, exponentiate = TRUE) %>% filter(grepl(":", term)) %>%
+    mutate(outcome = "Systolic BP >=90th percentile",  analysis = "Interactions"),
+  tidy(dia90_lpa, conf.int = TRUE, exponentiate = TRUE) %>% filter(grepl(":", term)) %>%
+    mutate(outcome = "Diastolic BP >=90th percentile", analysis = "Interactions"),
+  tidy(sys90_fam, conf.int = TRUE, exponentiate = TRUE) %>% filter(grepl(":", term)) %>%
+    mutate(outcome = "Systolic BP >=90th percentile",  analysis = "Interactions"),
+  tidy(dia90_fam, conf.int = TRUE, exponentiate = TRUE) %>% filter(grepl(":", term)) %>%
+    mutate(outcome = "Diastolic BP >=90th percentile", analysis = "Interactions")
+)
+
+# Combine datasets and clean term labels for plotting
+plot_or_df <- bind_rows(main90_df, int90_df) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(term = case_when(
+    term == "lifestyle_tierModerate (2)" ~ "Moderate lifestyle",
+    term == "lifestyle_tierPoor (3-4)"   ~ "Poor lifestyle",
+    term == "screen1"                    ~ "Excessive screen time",
+    term == "sleep1"                     ~ "Poor sleep",
+    term == "ern_mds_score1"             ~ "Unhealthy diet",
+    term == "log_lpa"                    ~ "Lp(a) (log)",
+    term == "who_bmi_for_age_z"            ~ "BMI",
+    grepl("Moderate.*log_lpa", term)     ~ "Moderate lifestyle × Lp(a)",
+    grepl("Poor.*log_lpa",     term)     ~ "Poor lifestyle × Lp(a)",
+    grepl("Moderate.*who_bmi_for_age_z", term)     ~ "Moderate lifestyle × BMI",
+    grepl("Poor.*who_bmi_for_age_z",     term)     ~ "Poor lifestyle × BMI",
+    TRUE ~ term
+  ),
+  analysis = factor(analysis, levels = c("Main effects", "Interactions")))
+
+# Generate forest plot for binary BP outcomes
+p_forest_binary <- ggplot(plot_or_df,
+       aes(x = estimate, y = reorder(term, estimate),
+           xmin = conf.low, xmax = conf.high,
+           colour = outcome, group = outcome)) + 
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_errorbarh(height = 0.25, position = position_dodge(width = 0.6)) +
+  geom_point(size = 3, position = position_dodge(width = 0.6)) +
+  facet_wrap(~analysis, scales = "free_y", ncol = 2) +
+  scale_colour_manual(values = c(
+    "Systolic BP >=90th percentile" = "#2166AC",
+    "Diastolic BP >=90th percentile" = "#B2182B")) +
+  scale_x_log10(breaks = c(0.25, 0.5, 1, 2, 4)) + 
+  labs(x = "Odds ratio (95% CI)", y = NULL, colour = "Outcome") +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(size = 14),
+    axis.text.y = element_text(size = 15),
+    axis.title = element_text(size = 16, face = "bold"),
+    strip.text = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 15, face = "bold"),
+    panel.spacing = unit(2, "lines")
+  )
+
+p_forest_binary
+```
+
+# BP in 3 categories (<P75 / P75-P90 / >=P90) multinomial models + odds-ratio forest plot
+
+```{r fig.width=12, fig.height=10}
+# Extract odds ratios for multinomial BP category models
+main_cat_df <- bind_rows(
+  tidy(sys_main_cat, exponentiate = TRUE, conf.int = TRUE) %>%
+    mutate(outcome = "Systolic BP",  panel = "A: Main effects"),
+  tidy(dia_main_cat, exponentiate = TRUE, conf.int = TRUE) %>%
+    mutate(outcome = "Diastolic BP", panel = "A: Main effects")
+)
+
+int_cat_df <- bind_rows(
+  tidy(sys_lpa_int_cat, exponentiate = TRUE, conf.int = TRUE) %>% filter(grepl(":", term)) %>%
+    mutate(outcome = "Systolic BP",  panel = "B: Interactions"),
+  tidy(dia_lpa_int_cat, exponentiate = TRUE, conf.int = TRUE) %>% filter(grepl(":", term)) %>%
+    mutate(outcome = "Diastolic BP", panel = "B: Interactions"),
+  tidy(sys_fam_int_cat, exponentiate = TRUE, conf.int = TRUE) %>% filter(grepl(":", term)) %>%
+    mutate(outcome = "Systolic BP",  panel = "B: Interactions"),
+  tidy(dia_fam_int_cat, exponentiate = TRUE, conf.int = TRUE) %>% filter(grepl(":", term)) %>%
+    mutate(outcome = "Diastolic BP", panel = "B: Interactions")
+)
+
+plot_cat_df <- bind_rows(main_cat_df, int_cat_df) %>%
+  filter(term != "(Intercept)")
+
+# Relabel terms for plotting
+plot_cat_df <- plot_cat_df %>%
+  mutate(term = case_when(
+    term == "lifestyle_tierModerate (2)"                     ~ "Moderate lifestyle",
+    term == "lifestyle_tierPoor (3-4)"                      ~ "Poor lifestyle",
+    term == "screen1"                                       ~ "Excessive screen",
+    term == "sleep1"                                        ~ "Poor sleep",
+    term == "ern_mds_score1"                                ~ "Unhealthy diet",
+    term == "log_lpa"                                       ~ "Lp(a)",
+    term == "who_bmi_for_age_z"                             ~ "BMI z-score",
+    term == "lifestyle_tierModerate (2):log_lpa"            ~ "Moderate × Lp(a)",
+    term == "lifestyle_tierPoor (3-4):log_lpa"              ~ "Poor × Lp(a)",
+    term == "lifestyle_tierModerate (2):who_bmi_for_age_z"  ~ "Moderate × BMI",
+    term == "lifestyle_tierPoor (3-4):who_bmi_for_age_z"    ~ "Poor × BMI",
+    TRUE ~ term
+  ))
+
+# Generate multinomial forest plot
+plot_cat_df$y.level <- factor(plot_cat_df$y.level, levels = c("P75-P90", ">=P90"))
+
+p_forest_multi <- ggplot(plot_cat_df,
+       aes(x = estimate, y = reorder(term, estimate),
+           xmin = conf.low, xmax = conf.high,
+           colour = outcome, group = outcome)) +       
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_errorbarh(height = 0.25, position = position_dodge(width = 0.6)) +
+  geom_point(size = 3, position = position_dodge(width = 0.6)) +
+  facet_grid(panel ~ y.level, scales = "free_y") +
+  scale_colour_manual(values = c("Systolic BP" = "#2166AC", "Diastolic BP" = "#B2182B")) +
+  scale_x_log10() +
+  labs(x = "Odds ratio (95% CI)", y = NULL, colour = "BP outcome") +
+  theme_bw(base_size = 18) +
+  theme(
+    legend.position  = "bottom",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text        = element_text(size = 14),
+    axis.text.y      = element_text(size = 15),
+    strip.text       = element_text(size = 16, face = "bold")
+  )
+
+p_forest_multi
+```
+
+# Supplementary tables: Estimate + 95% CI
+
+```{r}
+# Helper function to tidy models into Estimate, 95% CI, and p-value format
+tidy_ci <- function(model, model_label, exponentiate = FALSE) {
+  broom::tidy(model, conf.int = TRUE, exponentiate = exponentiate) %>%
+    filter(term != "(Intercept)") %>%
+    transmute(
+      Model    = model_label,
+      Term     = term,
+      Estimate = round(estimate, 3),
+      `95% CI` = sprintf("%.2f, %.2f", conf.low, conf.high),
+      `p-value` = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value))
+    )
+}
+
+# Task 5: Main linear BP models (effect in mmHg)
+supp_linear <- bind_rows(
+  tidy_ci(m1_sys, "Systolic  M1: Base"),
+  tidy_ci(m2_sys, "Systolic  M2: + Lifestyle & Family Hx"),
+  tidy_ci(m3_sys, "Systolic  M3: + Components"),
+  tidy_ci(m4_sys, "Systolic  M4: Lp(a) x Family Hx"),
+  tidy_ci(m1_dia, "Diastolic M1: Base"),
+  tidy_ci(m2_dia, "Diastolic M2: + Lifestyle & Family Hx"),
+  tidy_ci(m3_dia, "Diastolic M3: + Components"),
+  tidy_ci(m4_dia, "Diastolic M4: Lp(a) x Family Hx")
+)
+
+ft_supp_linear <- flextable(supp_linear) %>%
+  set_caption("Supplementary Table S1. Linear BP models — estimate (mmHg) and 95% CI") %>%
+  autofit()
+ft_supp_linear
+
+# Task 6: Composite lifestyle score models (estimate + 95% CI)
+df_reg$lifestyle_tier <- relevel(factor(df_reg$lifestyle_tier), ref = "Ideal (0-1)")
+
+mc_sys_lin  <- lm(bp_sys ~ comp_score + log_lpa + age + sex + who_bmi_for_age_z, data = df_reg)
+mc_sys_tier <- lm(bp_sys ~ lifestyle_tier + log_lpa + age + sex + who_bmi_for_age_z, data = df_reg)
+mc_dia_lin  <- lm(bp_dia ~ comp_score + log_lpa + age + sex + who_bmi_for_age_z, data = df_reg)
+mc_dia_tier <- lm(bp_dia ~ lifestyle_tier + log_lpa + age + sex + who_bmi_for_age_z, data = df_reg)
+
+supp_composite <- bind_rows(
+  tidy_ci(mc_sys_lin,  "Systolic  ~ comp_score (continuous)"),
+  tidy_ci(mc_sys_tier, "Systolic  ~ lifestyle tier"),
+  tidy_ci(mc_dia_lin,  "Diastolic ~ comp_score (continuous)"),
+  tidy_ci(mc_dia_tier, "Diastolic ~ lifestyle tier"),
+  tidy_ci(m_factor_sys, "Systolic  ~ comp_score (factor)"),
+  tidy_ci(m_factor_dia, "Diastolic ~ comp_score (factor)")
+)
+
+ft_supp_composite <- flextable(supp_composite) %>%
+  set_caption("Supplementary Table S2. Composite-score models — estimate and 95% CI") %>%
+  autofit()
+ft_supp_composite
+
+# Task 7: Compare composite score vs individual components via nested F-test
+mod_comp_sys       <- lm(bp_sys ~ comp_score + log_lpa + age + sex + who_bmi_for_age_z, data = df_reg)
+mod_components_sys <- lm(bp_sys ~ screen + sleep + ern_mds_score + phy_act_score +
+                           log_lpa + age + sex + who_bmi_for_age_z, data = df_reg)
+mod_comp_dia       <- lm(bp_dia ~ comp_score + log_lpa + age + sex + who_bmi_for_age_z, data = df_reg)
+mod_components_dia <- lm(bp_dia ~ screen + sleep + ern_mds_score + phy_act_score +
+                           log_lpa + age + sex + who_bmi_for_age_z, data = df_reg)
+
+comp_vs_components <- bind_rows(
+  broom::tidy(anova(mod_comp_sys, mod_components_sys)) %>% mutate(Outcome = "Systolic BP"),
+  broom::tidy(anova(mod_comp_dia, mod_components_dia)) %>% mutate(Outcome = "Diastolic BP")
+) %>%
+  mutate(Model = rep(c("Composite (equal weights)", "Components (free)"), 2),
+         across(c(sumsq, statistic), ~ round(.x, 2)),
+         p.value = ifelse(is.na(p.value), "-",
+                          format.pval(p.value, digits = 3, eps = 0.001))) %>%
+  dplyr::select(Outcome, Model, df, sumsq, statistic, p.value)
+
+ft_comp_vs_components <- flextable(comp_vs_components) %>%
+  set_caption("Supplementary Table S3. Composite score vs individual components (nested F-test)") %>%
+  autofit()
+ft_comp_vs_components
+
+# Export the supplementary tables to a Word file
+read_docx() %>%
+  body_add_par("Supplementary Tables", style = "heading 1") %>%
+  body_add_par("S1. Linear BP models (estimate + 95% CI)", style = "heading 2") %>%
+  body_add_flextable(ft_supp_linear) %>% body_add_par("", style = "Normal") %>%
+  body_add_par("S2. Composite-score models (estimate + 95% CI)", style = "heading 2") %>%
+  body_add_flextable(ft_supp_composite) %>% body_add_par("", style = "Normal") %>%
+  body_add_par("S3. Composite vs components (nested F-test)", style = "heading 2") %>%
+  body_add_flextable(ft_comp_vs_components) %>%
+  print(target = "supplementary_tables.docx")
+
+cat("Wrote supplementary_tables.docx (S1, S2, S3)\n")
+```
+
+# Visualizations
+
+```{r}
+# Blood pressure by lifestyle score (systolic + diastolic)
+p_bp_lifestyle <- df %>%
+  dplyr::select(comp_score, bp_sys, bp_dia) %>%
+  drop_na(comp_score) %>%
+  pivot_longer(c(bp_sys, bp_dia), names_to = "bp_type", values_to = "bp") %>%
+  drop_na(bp) %>%
+  mutate(bp_type = factor(bp_type, levels = c("bp_sys", "bp_dia"),
+                          labels = c("Systolic", "Diastolic"))) %>%
+  ggplot(aes(factor(comp_score), bp, fill = factor(comp_score))) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~bp_type, scales = "free_y") +
+  scale_fill_viridis_d() +
+  theme_minimal() +
+  labs(title = "Blood Pressure by Lifestyle Score",
+       x = "Lifestyle Score (0 = best, 4 = worst)",
+       y = "Blood Pressure (mmHg)", fill = "Score")
+p_bp_lifestyle
+
+# Systolic BP by combined family history
+p_bp_famhist <- df %>%
+  drop_na(card_risk_fam_combined, bp_sys) %>%
+  ggplot(aes(card_risk_fam_combined, bp_sys, fill = card_risk_fam_combined)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = c("No" = "#619CFF", "Yes" = "#F8766D")) +
+  theme_minimal() +
+  labs(title = "Systolic BP by Strong Family History",
+       x = "Combined Family History", y = "Systolic Blood Pressure")
+p_bp_famhist
+
+# BMI Z-Score vs Lp(a)
+p_bmi_lpa <- df %>%
+  filter(blood_value_lpa > 0) %>%
+  drop_na(who_bmi_for_age_z, blood_value_lpa) %>%
+  ggplot(aes(x = blood_value_lpa, y = who_bmi_for_age_z)) +
+  geom_point(alpha = 0.4, color = "#1B9E77") +
+  geom_smooth(method = "lm", se = TRUE, color = "#D95F02") +
+  scale_x_log10() +
+  theme_minimal() +
+  labs(title = "Spread of BMI Z-Score Across Lp(a)",
+       x = "Lp(a), mg/L (log scale)", y = "BMI Z-Score")
+p_bmi_lpa
+
+# Lp(a) across age
+p_lpa_age <- df %>%
+  filter(blood_value_lpa > 0) %>%
+  drop_na(age, blood_value_lpa) %>%
+  ggplot(aes(x = age, y = blood_value_lpa)) +
+  geom_point(alpha = 0.4, color = "#2C7FB8") +
+  geom_smooth(method = "loess", se = TRUE, color = "#D95F02") +
+  scale_y_log10() +
+  scale_x_continuous(breaks = seq(6, 18, by = 1)) +
+  theme_minimal() +
+  labs(title = "Spread of Lp(a) Across Age (Up to 18 Years)",
+       x = "Age (years)", y = "Lp(a), mg/L (log scale)")
+p_lpa_age
+
+# Family history across age (logistic trend)
+p_famhist_age <- df %>%
+  drop_na(age, card_risk_fam_combined) %>%
+  mutate(fh_num = if_else(card_risk_fam_combined == "Yes", 1, 0)) %>%
+  ggplot(aes(age, fh_num, color = card_risk_fam_combined)) +
+  geom_jitter(height = 0.08, width = 0.2, alpha = 0.4) +
+  geom_smooth(aes(group = 1), method = "glm",
+              method.args = list(family = "binomial"),
+              se = TRUE, color = "black") +
+  scale_color_manual(values = c("No" = "#619CFF", "Yes" = "#F8766D")) +
+  scale_y_continuous(breaks = c(0, 1), labels = c("No", "Yes")) +
+  theme_minimal() +
+  labs(title = "Family History Across Age",
+       x = "Age (years)", y = "Family History", color = "Family History")
+p_famhist_age
+
+# Blood pressure across age (systolic + diastolic)
+p_bp_age <- df %>%
+  dplyr::select(age, bp_sys, bp_dia) %>%
+  pivot_longer(c(bp_sys, bp_dia), names_to = "bp_type", values_to = "bp") %>%
+  drop_na(age, bp) %>%
+  mutate(bp_type = factor(bp_type, levels = c("bp_sys", "bp_dia"),
+                          labels = c("Systolic", "Diastolic"))) %>%
+  ggplot(aes(age, bp, color = bp_type)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = TRUE) +
+  scale_color_manual(values = c("Systolic" = "#F8766D", "Diastolic" = "#619CFF")) +
+  theme_minimal() +
+  labs(title = "Spread of Blood Pressure Across Age",
+       x = "Age (years)", y = "Blood Pressure (mmHg)", color = "BP Type")
+p_bp_age
+
+# Systolic BP across lifestyle score (scatter)
+p_bp_score_scatter <- df %>%
+  drop_na(comp_score, bp_sys) %>%
+  ggplot(aes(x = comp_score, y = bp_sys)) +
+  geom_jitter(alpha = 0.4, color = "#1B9E77", width = 0.2, height = 0) +
+  geom_smooth(method = "lm", se = TRUE, color = "#D95F02") +
+  scale_x_continuous(breaks = 0:4) +
+  theme_minimal() +
+  labs(title = "Systolic BP across Lifestyle Scores",
+       x = "Total Lifestyle Score (0 = Best, 4 = Worst)",
+       y = "Systolic Blood Pressure (mmHg)")
+p_bp_score_scatter
+
+# Systolic BP vs BMI Z-Score
+p_bp_bmi <- df %>%
+  drop_na(who_bmi_for_age_z, bp_sys) %>%
+  ggplot(aes(x = who_bmi_for_age_z, y = bp_sys)) +
+  geom_point(alpha = 0.4, color = "darkgray") +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  theme_minimal() +
+  labs(title = "Systolic BP vs. BMI Z-Score",
+       x = "BMI Z-Score", y = "Systolic Blood Pressure (mmHg)")
+p_bp_bmi
+
+# Log Lp(a) vs Systolic BP
+p_lpa_bp <- df %>%
+  drop_na(log_lpa, bp_sys) %>%
+  ggplot(aes(x = log_lpa, y = bp_sys)) +
+  geom_point(alpha = 0.4, color = "purple") +
+  geom_smooth(method = "lm", color = "black", se = TRUE) +
+  theme_minimal() +
+  labs(title = "Log Lp(a) vs Systolic BP",
+       x = "Log Lp(a) (mg/L)", y = "Systolic BP (mmHg)")
+p_lpa_bp
+
+# Density of log Lp(a) by family history
+p_lpa_density_fh <- df %>%
+  drop_na(log_lpa, card_risk_fam_combined) %>%
+  ggplot(aes(x = log_lpa, fill = card_risk_fam_combined)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("No" = "#619CFF", "Yes" = "#F8766D")) +
+  theme_minimal() +
+  labs(title = "Density of Log Lp(a) by Family History",
+       x = "Log Lp(a) (mg/L)", y = "Density", fill = "Family History")
+p_lpa_density_fh
+
+# Correlation matrix (continuous variables)
+cor_data <- df %>%
+  dplyr::select(age, who_bmi_for_age_z, bp_sys, bp_dia, log_lpa, comp_score) %>%
+  drop_na() %>%
+  cor() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Var1") %>%
+  pivot_longer(cols = -Var1, names_to = "Var2", values_to = "Correlation")
+
+p_corr <- ggplot(cor_data, aes(Var1, Var2, fill = Correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white",
+                       midpoint = 0, limit = c(-1, 1), space = "Lab",
+                       name = "Pearson\nCorrelation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(title = "Correlation Matrix of Key Continuous Variables", x = "", y = "")
+p_corr
+
+# Systolic BP across individual lifestyle components (violin)
+p_bp_components <- df %>%
+  dplyr::select(bp_sys, phy_act_score, ern_mds_score, screen, sleep) %>%
+  drop_na() %>%
+  pivot_longer(cols = c(phy_act_score, ern_mds_score, screen, sleep),
+               names_to = "Component", values_to = "Score") %>%
+  mutate(Component = recode(Component,
+                            "phy_act_score" = "Physical Activity",
+                            "ern_mds_score" = "Diet",
+                            "screen" = "Screen Time",
+                            "sleep" = "Sleep")) %>%
+  ggplot(aes(x = factor(Score), y = bp_sys, fill = factor(Score))) +
+  geom_violin(alpha = 0.6, trim = FALSE) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+  facet_wrap(~Component, scales = "free_x") +
+  scale_fill_viridis_d() +
+  theme_minimal() +
+  labs(title = "Systolic BP Across Individual Lifestyle Components",
+       x = "Component Risk Flag (0 = meets guideline, 1 = doesn't)",
+       y = "Systolic BP (mmHg)", fill = "Score")
+p_bp_components
+
+# Overall spread of Lp(a) in the whole dataset (histogram)
+p_lpa_spread_all <- df_raw %>%
+  filter(blood_value_lpa > 0) %>%
+  ggplot(aes(x = blood_value_lpa)) +
+  geom_histogram(bins = 40, fill = "#2C7FB8", color = "white", alpha = 0.85) +
+  scale_x_log10() +
+  theme_minimal() +
+  labs(title = "Overall Spread of Lp(a) (Whole Dataset)",
+       x = "Lp(a), mg/L (log scale)", y = "Count")
+p_lpa_spread_all
+
+# Lp(a) vs log Lp(a): raw skew vs log-transformed, side by side
+p_lpa_vs_log <- df %>%
+  filter(blood_value_lpa > 0) %>%
+  dplyr::select(blood_value_lpa, log_lpa) %>%
+  pivot_longer(everything(), names_to = "scale", values_to = "value") %>%
+  mutate(scale = recode(scale,
+                        "blood_value_lpa" = "Raw Lp(a) (mg/L)",
+                        "log_lpa"         = "Log Lp(a)")) %>%
+  ggplot(aes(x = value, fill = scale)) +
+  geom_histogram(bins = 40, color = "white", alpha = 0.85) +
+  facet_wrap(~scale, scales = "free") +
+  scale_fill_manual(values = c("Raw Lp(a) (mg/L)" = "#F8766D", "Log Lp(a)" = "#1B9E77")) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(title = "Lp(a): Raw vs Log-Transformed Distribution",
+       x = "Value", y = "Count")
+p_lpa_vs_log
+
+# Family history: whole dataset vs analysis sample
+fh_compare <- bind_rows(
+  df_raw %>% mutate(dataset = "Whole dataset") %>% dplyr::select(dataset, card_risk_fam_combined),
+  df     %>% mutate(dataset = "Analysis sample") %>% dplyr::select(dataset, card_risk_fam_combined)
+) %>%
+  mutate(card_risk_fam_combined = if_else(is.na(card_risk_fam_combined),
+                                        "Unknown", card_risk_fam_combined),
+         dataset = factor(dataset, levels = c("Whole dataset", "Analysis sample")))
+
+p_fh_compare <- fh_compare %>%
+  count(dataset, card_risk_fam_combined) %>%
+  group_by(dataset) %>%
+  mutate(pct = 100 * n / sum(n)) %>%
+  ggplot(aes(x = card_risk_fam_combined, y = pct, fill = dataset)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  scale_fill_manual(values = c("Whole dataset" = "#9E9E9E", "Analysis sample" = "#1A9850")) +
+  theme_minimal() +
+  labs(title = "Family History Spread: Whole vs Analysis",
+       x = "Family History", y = "Percentage (%)", fill = "Dataset")
+p_fh_compare
+
+# Lifestyle score spread — analysis sample only
+p_lifestyle_spread <- df %>%
+  drop_na(comp_score) %>%
+  count(comp_score) %>%
+  mutate(pct = 100 * n / sum(n)) %>%
+  ggplot(aes(x = factor(comp_score), y = pct)) +
+  geom_col(fill = "#1B9E77", alpha = 0.85) +
+  geom_text(aes(label = paste0(round(pct, 1), "%")), vjust = -0.4, size = 3) +
+  theme_minimal() +
+  labs(title = "Lifestyle Score Spread (Analysis Sample)",
+       x = "Lifestyle Score (0 = best, 4 = worst)", y = "Percentage (%)")
+p_lifestyle_spread
+
+# Included vs Excluded comparisons
+compare_df <- df_raw %>%
+  mutate(id = as.factor(id),
+         status = if_else(id %in% df$id, "Included", "Excluded"),
+         status = factor(status, levels = c("Included", "Excluded")))
+
+# Age spread
+p_excl_age <- compare_df %>%
+  drop_na(age) %>%
+  ggplot(aes(x = age, fill = status)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("Included" = "#1A9850", "Excluded" = "#9E9E9E")) +
+  theme_minimal() +
+  labs(title = "Age: Included vs Excluded", x = "Age (years)", y = "Density", fill = NULL)
+p_excl_age
+
+# BMI spread
+p_excl_bmi <- compare_df %>%
+  drop_na(who_bmi_for_age_z) %>%
+  ggplot(aes(x = who_bmi_for_age_z, fill = status)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("Included" = "#1A9850", "Excluded" = "#9E9E9E")) +
+  theme_minimal() +
+  labs(title = "BMI Z-Score: Included vs Excluded",
+       x = "BMI Z-Score", y = "Density", fill = NULL)
+p_excl_bmi
+
+# Systolic + diastolic BP spread
+p_excl_bp <- compare_df %>%
+  dplyr::select(status, bp_sys, bp_dia) %>%
+  pivot_longer(c(bp_sys, bp_dia), names_to = "bp_type", values_to = "bp") %>%
+  drop_na(bp) %>%
+  mutate(bp_type = recode(bp_type, "bp_sys" = "Systolic", "bp_dia" = "Diastolic")) %>%
+  ggplot(aes(x = status, y = bp, fill = status)) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~bp_type, scales = "free_y") +
+  scale_fill_manual(values = c("Included" = "#1A9850", "Excluded" = "#9E9E9E")) +
+  theme_minimal() +
+  labs(title = "Blood Pressure: Included vs Excluded",
+       x = NULL, y = "Blood Pressure (mmHg)", fill = NULL)
+p_excl_bp
+
+# Sex distribution
+p_excl_sex <- compare_df %>%
+  drop_na(sex) %>%
+  filter(sex != "Diverse") %>%
+  count(status, sex) %>%
+  group_by(status) %>%
+  mutate(pct = 100 * n / sum(n)) %>%
+  ggplot(aes(x = sex, y = pct, fill = status)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  scale_fill_manual(values = c("Included" = "#1A9850", "Excluded" = "#9E9E9E")) +
+  theme_minimal() +
+  labs(title = "Sex: Included vs Excluded",
+       x = "Sex", y = "Percentage (%)", fill = NULL)
+p_excl_sex
+
+# Histograms: spread of continuous variables
+p_hist_continuous <- df %>%
+  dplyr::select(age, who_bmi_for_age_z, bp_sys, bp_dia, log_lpa) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Value") %>%
+  drop_na(Value) %>%
+  mutate(Variable = recode(Variable,
+                           "age" = "Age", "bp_sys" = "Systolic BP",
+                           "bp_dia" = "Diastolic BP", "log_lpa" = "Log Lp(a)",
+                           "who_bmi_for_age_z" = "BMI Z-Score")) %>%
+  ggplot(aes(x = Value, fill = Variable)) +
+  geom_histogram(bins = 30, alpha = 0.7, color = "black") +
+  facet_wrap(~Variable, scales = "free") +
+  scale_fill_viridis_d() +
+  theme_minimal() + theme(legend.position = "none") +
+  labs(title = "Distribution of Key Continuous Variables",
+       x = "Value", y = "Frequency Count")
+p_hist_continuous
+
+# Bar charts: spread of categorical variables
+p_bar_categorical <- df %>%
+  dplyr::select(sex, card_risk_fam_combined, comp_score) %>%
+  mutate(comp_score = as.character(comp_score)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Category") %>%
+  drop_na(Category) %>%
+  mutate(Variable = recode(Variable,
+                           "card_risk_fam_combined" = "Family History of CVD",
+                           "comp_score" = "Composite Score", "sex" = "Sex")) %>%
+  ggplot(aes(x = Category, fill = Category)) +
+  geom_bar(alpha = 0.8, color = "black") +
+  facet_wrap(~Variable, scales = "free") +
+  scale_fill_viridis_d(option = "plasma") +
+  theme_minimal() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Count of Categorical Variables",
+       x = "Category", y = "Number of Participants")
+p_bar_categorical
+
+# Lp(a) vs continuous variables (faceted scatter)
+p_lpa_vs_continuous <- df %>%
+  filter(blood_value_lpa > 0) %>%
+  dplyr::select(blood_value_lpa, age, who_bmi_for_age_z, bp_sys, bp_dia) %>%
+  pivot_longer(cols = c(age, who_bmi_for_age_z, bp_sys, bp_dia),
+               names_to = "Variable", values_to = "Value") %>%
+  drop_na() %>%
+  mutate(Variable = recode(Variable,
+                           "age" = "Age", "bp_sys" = "Systolic BP",
+                           "bp_dia" = "Diastolic BP", "who_bmi_for_age_z" = "BMI Z-Score")) %>%
+  ggplot(aes(x = blood_value_lpa, y = Value)) +
+  geom_point(alpha = 0.2, color = "#2C7FB8") +
+  geom_smooth(method = "lm", color = "#D95F02", se = TRUE) +
+  scale_x_log10() +
+  facet_wrap(~Variable, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Lp(a) vs. Continuous Variables",
+       x = "Lp(a), mg/L (log scale)", y = "Variable Value")
+p_lpa_vs_continuous
+
+# Lp(a) vs categorical variables (faceted boxplot)
+p_lpa_vs_categorical <- df %>%
+  filter(blood_value_lpa > 0) %>%
+  dplyr::select(blood_value_lpa, sex, card_risk_fam_combined, comp_score) %>%
+  mutate(comp_score = as.character(comp_score)) %>%
+  pivot_longer(cols = c(sex, card_risk_fam_combined, comp_score),
+               names_to = "Variable", values_to = "Category") %>%
+  drop_na() %>%
+  mutate(Variable = recode(Variable, "sex" = "Sex",
+                           "card_risk_fam_combined" = "Family History of CVD",
+                           "comp_score" = "Composite Score")) %>%
+  ggplot(aes(x = Category, y = blood_value_lpa, fill = Category)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.4) +
+  scale_y_log10() +
+  facet_wrap(~Variable, scales = "free_x") +
+  scale_fill_viridis_d() +
+  theme_minimal() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Spread of Lp(a) Across Categories",
+       x = "Category", y = "Lp(a), mg/L (log scale)")
+p_lpa_vs_categorical
+
+# Lp(a) developmental trajectory (smooth only)
+p_lpa_trajectory <- df %>%
+  filter(blood_value_lpa > 0) %>%
+  drop_na(age, blood_value_lpa) %>%
+  ggplot(aes(x = age, y = blood_value_lpa)) +
+  geom_smooth(method = "loess", se = TRUE, color = "#D95F02", fill = "gray80") +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(title = "Developmental Trajectory of Lp(a)",
+       x = "Age (years)", y = "Lp(a), mg/L (log scale)")
+p_lpa_trajectory
+
+# Lp(a) density by sex
+p_lpa_density_sex <- df %>%
+  filter(blood_value_lpa > 0) %>%
+  drop_na(sex) %>%
+  ggplot(aes(x = blood_value_lpa, fill = sex, color = sex)) +
+  geom_density(alpha = 0.4) +
+  scale_x_log10() +
+  scale_fill_manual(values = c("female" = "#F8766D", "male" = "#619CFF")) +
+  scale_color_manual(values = c("female" = "#F8766D", "male" = "#619CFF")) +
+  theme_minimal() +
+  labs(title = "Lp(a) Distribution by Sex",
+       x = "Lp(a), mg/L (log scale)", y = "Density", fill = "Sex", color = "Sex")
+p_lpa_density_sex
+
+# Lp(a) by family history (boxplot + jitter)
+p_lpa_famhist_box <- df %>%
+  filter(blood_value_lpa > 0) %>%
+  drop_na(card_risk_fam_combined) %>%
+  ggplot(aes(x = card_risk_fam_combined, y = blood_value_lpa, fill = card_risk_fam_combined)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.3, size = 1.5) +
+  scale_y_log10() +
+  scale_fill_manual(values = c("No" = "#619CFF", "Yes" = "#F8766D")) +
+  theme_minimal() +
+  labs(title = "Lp(a) by Family History of CVD",
+       x = "Family History", y = "Lp(a), mg/L (log scale)", fill = "Family History")
+p_lpa_famhist_box
+
+# Lp(a) by lifestyle tier (violin + boxplot)
+p_lpa_tier <- df %>%
+  filter(blood_value_lpa > 0) %>%
+  drop_na(lifestyle_tier) %>%
+  ggplot(aes(x = lifestyle_tier, y = blood_value_lpa, fill = lifestyle_tier)) +
+  geom_violin(alpha = 0.5, trim = FALSE) +
+  geom_boxplot(width = 0.15, alpha = 0.8, outlier.shape = NA) +
+  scale_y_log10() +
+  scale_fill_manual(values = c("Ideal (0-1)" = "#1A9850", "Moderate (2)" = "#FEE08B",
+                               "Poor (3-4)" = "#D73027")) +
+  theme_minimal() +
+  labs(title = "Lp(a) Levels by Lifestyle Tier",
+       subtitle = "Violin + boxplot; log scale",
+       x = "Lifestyle Tier", y = "Lp(a), mg/L (log scale)", fill = "Lifestyle Tier")
+p_lpa_tier
+
+# Spearman correlation heatmap
+cont_vars <- df %>%
+  dplyr::select(blood_value_lpa, log_lpa, bp_sys, bp_dia, age, who_bmi_for_age_z,
+                comp_score, time_screen_weekday, time_screen_weekend) %>%
+  rename("Lp(a)" = blood_value_lpa, "log Lp(a)" = log_lpa,
+         "Systolic BP" = bp_sys, "Diastolic BP" = bp_dia, "Age" = age,
+         "BMI z-score" = who_bmi_for_age_z, "Lifestyle Score" = comp_score,
+         "Screen (weekday)" = time_screen_weekday,
+         "Screen (weekend)" = time_screen_weekend)
+
+cor_mat  <- cor(cont_vars, use = "pairwise.complete.obs", method = "spearman")
+cor_melt <- melt(cor_mat)
+
+p_spearman_heatmap <- ggplot(cor_melt, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), size = 2.8) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#D6604D",
+                       midpoint = 0, limits = c(-1, 1)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Spearman Correlation Heatmap", x = NULL, y = NULL, fill = "r")
+p_spearman_heatmap
+
+# BMI z-score distribution by sex
+p_bmi_by_sex <- df %>%
+  drop_na(who_bmi_for_age_z, sex) %>%
+  ggplot(aes(x = who_bmi_for_age_z, fill = sex)) +
+  geom_histogram(binwidth = 0.3, alpha = 0.6, position = "identity") +
+  geom_vline(xintercept = c(-2, 1, 2), linetype = "dashed",
+             color = c("blue", "orange", "red"), linewidth = 0.7) +
+  scale_fill_manual(values = c("female" = "#F8766D", "male" = "#619CFF")) +
+  theme_minimal() +
+  labs(title = "BMI z-score Distribution by Sex",
+       subtitle = "Dashed: z = -2 (underweight), +1 (overweight), +2 (obese)",
+       x = "WHO BMI-for-age z-score", y = "Count", fill = "Sex")
+p_bmi_by_sex
+
+# BMI z-score vs Lp(a) (loess)
+p_bmi_vs_lpa <- df %>%
+  filter(blood_value_lpa > 0) %>%
+  drop_na(who_bmi_for_age_z) %>%
+  ggplot(aes(x = who_bmi_for_age_z, y = blood_value_lpa)) +
+  geom_point(alpha = 0.35, color = "#2C7FB8") +
+  geom_smooth(method = "loess", se = TRUE, color = "#D95F02") +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(title = "BMI z-score vs Lp(a)",
+       x = "WHO BMI-for-age z-score", y = "Lp(a), mg/L (log scale)")
+p_bmi_vs_lpa
+
+# Coefficient plot: compare systolic models
+tidy_models_sys <- bind_rows(
+  tidy(m1_sys, conf.int = TRUE) %>% mutate(model = "M1: Base"),
+  tidy(m2_sys, conf.int = TRUE) %>% mutate(model = "M2: + Family Hx"),
+  tidy(m3_sys, conf.int = TRUE) %>% mutate(model = "M3: + Lifestyle")
+)
+
+p_coef_sys <- tidy_models_sys %>%
+  filter(term != "(Intercept)") %>%
+  ggplot(aes(x = estimate, y = term, color = model, xmin = conf.low, xmax = conf.high)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_pointrange(position = position_dodge(width = 0.5), size = 0.6) +
+  scale_color_manual(values = c("M1: Base" = "#2166AC", "M2: + Family Hx" = "#F8766D",
+                                "M3: + Lifestyle" = "#1A9850")) +
+  theme_minimal() +
+  labs(title = "Coefficient Plot: Systolic BP Models",
+       x = "Estimate (mmHg)", y = "Predictor", color = "Model")
+p_coef_sys
+
+# Lifestyle x family history interaction
+p_interaction <- df %>%
+  drop_na(comp_score, card_risk_fam_combined, bp_sys) %>%
+  ggplot(aes(x = comp_score, y = bp_sys,
+             color = card_risk_fam_combined, fill = card_risk_fam_combined)) +
+  geom_point(alpha = 0.25) +
+  geom_smooth(method = "lm", se = TRUE, alpha = 0.15) +
+  scale_color_manual(values = c("No" = "#619CFF", "Yes" = "#F8766D")) +
+  scale_fill_manual(values = c("No" = "#619CFF", "Yes" = "#F8766D")) +
+  theme_minimal() +
+  labs(title = "Lifestyle Score x Family History on Systolic BP",
+       x = "Lifestyle Score (0-4)", y = "Systolic BP (mmHg)",
+       color = "Family History", fill = "Family History")
+p_interaction
+
+# Elevated Lp(a) prevalence by lifestyle tier
+df <- df %>%
+  mutate(lpa_elevated = case_when(
+    blood_value_lpa >= 75 ~ "Elevated (>=75 nmol/L)",
+    blood_value_lpa >= 0  ~ "Normal (<75 nmol/L)",
+    TRUE ~ NA_character_
+  ))
+
+p_lpa_elevated_tier <- df %>%
+  drop_na(lpa_elevated, lifestyle_tier) %>%
+  count(lifestyle_tier, lpa_elevated) %>%
+  group_by(lifestyle_tier) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ggplot(aes(x = lifestyle_tier, y = pct, fill = lpa_elevated)) +
+  geom_col(position = "stack", alpha = 0.85) +
+  scale_fill_manual(values = c("Elevated (>=75 nmol/L)" = "#D73027",
+                               "Normal (<75 nmol/L)" = "#91BFDB")) +
+  theme_minimal() +
+  labs(title = "Prevalence of Elevated Lp(a) by Lifestyle Tier",
+       x = "Lifestyle Tier", y = "Percentage (%)", fill = "Lp(a) Status")
+p_lpa_elevated_tier      
+
+# Blood pressure across age, coloured by sex
+p_bp_age_sex <- df %>%
+  dplyr::select(age, sex, bp_sys, bp_dia) %>%
+  pivot_longer(c(bp_sys, bp_dia), names_to = "bp_type", values_to = "bp") %>%
+  drop_na(age, bp, sex) %>%
+  mutate(bp_type = factor(bp_type, levels = c("bp_sys", "bp_dia"),
+                          labels = c("Systolic", "Diastolic"))) %>%
+  ggplot(aes(x = age, y = bp, color = sex)) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1) +
+  facet_wrap(~bp_type, scales = "free_y") +
+  scale_color_manual(values = c("female" = "#F8766D", "male" = "#619CFF")) +
+  scale_x_continuous(breaks = seq(9, 18, by = 1)) +
+  theme_minimal(base_size = 13) +
+  labs(title = "Blood Pressure Across Age by Sex",
+       x = "Age (years)", y = "Blood Pressure (mmHg)", color = "Sex")
+p_bp_age_sex
+
+# Log Lp(a) vs systolic BP, split by lifestyle tier
+p_lpa_bp_tier <- df %>%
+  drop_na(log_lpa, bp_sys, lifestyle_tier) %>%
+  ggplot(aes(x = log_lpa, y = bp_sys, color = lifestyle_tier)) +
+  geom_point(alpha = 0.35, size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE) +
+  facet_wrap(~lifestyle_tier) +
+  scale_color_manual(values = c("Ideal (0-1)" = "#1A9850", "Moderate (2)" = "#E6AB02",
+                                "Poor (3-4)" = "#D73027")) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none") +
+  labs(title = "Lp(a)-Blood Pressure Relationship by Lifestyle Tier",
+       x = "Log Lp(a) (mg/L)", y = "Systolic BP (mmHg)")
+p_lpa_bp_tier
+
+# Raincloud: systolic BP across lifestyle score
+p_bp_raincloud <- df %>%
+  drop_na(comp_score, bp_sys) %>%
+  ggplot(aes(x = factor(comp_score), y = bp_sys, fill = factor(comp_score))) +
+  geom_violin(alpha = 0.5, trim = FALSE, width = 0.9) +
+  geom_boxplot(width = 0.12, fill = "white", outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.08, alpha = 0.25, size = 1) +
+  scale_fill_viridis_d() +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none") +
+  labs(title = "Distribution of Systolic BP Across Lifestyle Score",
+       x = "Lifestyle Score (0 = best, 4 = worst)", y = "Systolic BP (mmHg)")
+p_bp_raincloud
+
+# Bubble chart: 4 variables in 2D
+p_bubble <- df %>%
+  filter(blood_value_lpa > 0) %>%
+  drop_na(age, bp_sys, blood_value_lpa, lifestyle_tier) %>%
+  ggplot(aes(x = age, y = bp_sys, size = blood_value_lpa, color = lifestyle_tier)) +
+  geom_point(alpha = 0.5) +
+  scale_size_continuous(range = c(1, 9), trans = "log10", name = "Lp(a)") +
+  scale_color_manual(values = c("Ideal (0-1)" = "#1A9850", "Moderate (2)" = "#E6AB02",
+                                "Poor (3-4)" = "#D73027"), name = "Lifestyle tier") +
+  theme_minimal(base_size = 13) +
+  labs(title = "Age, Blood Pressure, Lp(a) and Lifestyle in One View",
+       x = "Age (years)", y = "Systolic BP (mmHg)")
+p_bubble
+
+# Pairs plot: all key continuous variables at once
+p_pairs <- df %>%
+  filter(blood_value_lpa > 0) %>%
+  dplyr::select(age, who_bmi_for_age_z, bp_sys, bp_dia, log_lpa, comp_score, sex) %>%
+  drop_na() %>%
+  ggpairs(
+    columns = 1:6,
+    mapping = aes(color = sex, alpha = 0.5),
+    upper = list(continuous = wrap("cor", size = 3)),
+    lower = list(continuous = wrap("points", size = 0.6, alpha = 0.3)),
+    diag  = list(continuous = wrap("densityDiag", alpha = 0.5)),
+    columnLabels = c("Age", "BMI z", "Sys BP", "Dia BP", "log Lp(a)", "Lifestyle")
+  ) +
+  theme_minimal(base_size = 10)
+p_pairs
+
+```
+
+# Descriptive Tables for Manuscript
+
+```{r}
+# Define footnote text explaining the composite lifestyle risk score
+lifestyle_fn <- paste(
+  "Composite lifestyle risk score (0-4): one point each for insufficient",
+  "physical activity (below WHO), poor diet (Mediterranean diet score <=3),",
+  "excess screen time (above age cut-off), and short sleep (below age cut-off).",
+  "0 = ideal phenotype; 4 = all four adverse factors present. Tiers: Ideal (0-1), Moderate (2), Poor (3-4)."
+)
+
+# Table 1 — Overall sample characteristics
+table1 <- df_reg %>%
+  dplyr::select(age, sex, who_bmi_for_age_z, bp_sys, bp_dia,
+                blood_value_lpa, card_risk_fam_combined, comp_score) %>%
+  tbl_summary(
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      blood_value_lpa ~ "{median} ({p25}, {p75}); {mean} ({sd})"
+    ),
+    digits = list(all_continuous() ~ 1, who_bmi_for_age_z ~ 2),
+    label = list(
+      age ~ "Age (years)",
+      sex ~ "Sex",
+      who_bmi_for_age_z ~ "BMI z-score",
+      bp_sys ~ "Systolic BP (mmHg)",
+      bp_dia ~ "Diastolic BP (mmHg)",
+      blood_value_lpa ~ "Lp(a), mg/L",
+      card_risk_fam_combined ~ "Family history of CVD",
+      comp_score ~ "Lifestyle risk score (0-4)"
+    ),
+    missing = "ifany"
+  ) %>%
+  add_n() %>%
+  modify_header(label = "**Characteristic**") %>%
+  modify_caption(paste("**Table 1. Sample Characteristics.**", lifestyle_fn)) %>%
+  bold_labels()
+
+# Table 2 — Characteristics stratified by lifestyle tier
+table2 <- df_reg %>%
+  dplyr::select(age, sex, who_bmi_for_age_z, bp_sys, bp_dia,
+                blood_value_lpa, card_risk_fam_combined, lifestyle_tier) %>%
+  tbl_summary(
+    by = lifestyle_tier,
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      blood_value_lpa ~ "{median} ({p25}, {p75}); {mean} ({sd})"
+    ),
+    digits = list(all_continuous() ~ 1, who_bmi_for_age_z ~ 2),
+    label = list(
+      age ~ "Age (years)",
+      sex ~ "Sex",
+      who_bmi_for_age_z ~ "BMI z-score",
+      bp_sys ~ "Systolic BP (mmHg)",
+      bp_dia ~ "Diastolic BP (mmHg)",
+      blood_value_lpa ~ "Lp(a), mg/L",
+      card_risk_fam_combined ~ "Family history of CVD"
+    ),
+    missing = "ifany"
+  ) %>%
+  add_n() %>% add_p() %>% add_overall() %>%
+  modify_header(label = "**Characteristic**") %>%
+  modify_caption("**Table 2. Sample Characteristics by Lifestyle Tier**") %>%
+  bold_labels()
+
+# Define labels for regression models
+lab_main <- list(
+  lifestyle_tier ~ "Lifestyle Tier",
+  log_lpa ~ "Log Lp(a)",
+  card_risk_fam_combined ~ "Family history of CVD",
+  who_bmi_for_age_z ~ "BMI z-score",
+  age ~ "Age (years)",
+  sex ~ "Sex"
+)
+
+# Table 3 — Main effects models
+table3 <- tbl_merge(
+  tbls = list(
+    tbl_regression(sys_main, intercept = FALSE, label = lab_main) %>%
+      add_glance_source_note(include = c(nobs, r.squared, adj.r.squared)),
+    tbl_regression(dia_main, intercept = FALSE, label = lab_main) %>%
+      add_glance_source_note(include = c(nobs, r.squared, adj.r.squared))
+  ),
+  tab_spanner = c("**Systolic BP**", "**Diastolic BP**")
+) %>%
+  modify_caption("**Table 3. Main Effects Predictors of Blood Pressure**")
+
+# Table 4 — Interaction: Lifestyle x Lp(a)
+table4 <- tbl_merge(
+  tbls = list(
+    tbl_regression(sys_lpa_int, intercept = FALSE, label = lab_main) %>%
+      add_glance_source_note(include = c(nobs, r.squared, adj.r.squared)),
+    tbl_regression(dia_lpa_int, intercept = FALSE, label = lab_main) %>%
+      add_glance_source_note(include = c(nobs, r.squared, adj.r.squared))
+  ),
+  tab_spanner = c("**Systolic BP**", "**Diastolic BP**")
+) %>%
+  modify_caption("**Table 4. Lifestyle × Lp(a) Interaction on Blood Pressure**")
+
+# Table 5 — Interaction: Lifestyle x Family History
+table5 <- tbl_merge(
+  tbls = list(
+    tbl_regression(sys_fam_int, intercept = FALSE, label = lab_main) %>%
+      add_glance_source_note(include = c(nobs, r.squared, adj.r.squared)),
+    tbl_regression(dia_fam_int, intercept = FALSE, label = lab_main) %>%
+      add_glance_source_note(include = c(nobs, r.squared, adj.r.squared))
+  ),
+  tab_spanner = c("**Systolic BP**", "**Diastolic BP**")
+) %>%
+  modify_caption("**Table 5. Lifestyle × Family History Interaction on Blood Pressure**")
+
+# Define labels for ordinal regression models
+lab_ord <- list(
+  comp_score_f          ~ "Lifestyle risk score",
+  log_lpa               ~ "Log Lp(a)",
+  card_risk_fam_combined ~ "Family history of CVD",
+  age                   ~ "Age (years)",
+  sex                   ~ "Sex",
+  who_bmi_for_age_z     ~ "BMI z-score"
+)
+
+# Table 6 — Percentile-based BP (Ordinal Models)
+table6 <- tbl_merge(
+  tbls = list(
+    tbl_regression(m_pctl_sys, intercept = FALSE, exponentiate = TRUE, label = lab_ord) %>% 
+      add_glance_source_note(),
+    tbl_regression(m_pctl_dia, intercept = FALSE, exponentiate = TRUE, label = lab_ord) %>% 
+      add_glance_source_note()
+  ),
+  tab_spanner = c("**Systolic percentile**", "**Diastolic percentile**")
+) %>%
+  modify_caption("**Table 6. Lifestyle Score and Ordinal Percentile-Based Blood Pressure (Odds Ratios)**")
+
+# Export all manuscript tables to a single Word document
+all_tables <- list(
+  "Table 1" = table1,  "Table 2" = table2,  "Table 3" = table3,
+  "Table 4" = table4,  "Table 5" = table5,  "Table 6" = table6
+)
+
+tables_docx <- purrr::map(all_tables, as_flex_table)
+do.call(save_as_docx, c(tables_docx, path = "manuscript_tables.docx"))
+
+cat("Tables exported successfully to manuscript_tables.docx\n")
+```
+
+# Participant Flow Diagram
+
+```{r}
+# Calculate the drop for missing covariates in the final regression dataset
+n_missing_covariates <- nrow(df) - nrow(df_reg)
+n_final_cc <- nrow(df_reg)
+
+# Build the participant flow chart using Graphviz syntax
+graph_text <- glue::glue("
+digraph flowchart {{
+  graph [layout = dot, rankdir = TB]
+  
+  # Define node styles
+  node [shape = box, fontname = Helvetica, fontsize = 12, width = 3.5, style = filled, fillcolor = '#F9F9F9', color = '#555555']
+  edge [fontname = Helvetica, fontsize = 10, color = '#555555']
+  
+  # Inclusion nodes (Main vertical spine)
+  total [label = 'Total participants in raw dataset\\nn = {n_total}']
+  blood [label = 'Blood tested\\nn = {n_blood}']
+  lpa   [label = 'Valid Lp(a) measurement\\nn = {n_lpa}']
+  age   [label = 'Aged 9-18 years\\nn = {n_age}']
+  sex   [label = 'Sex: Male/Female\\nn = {n_sex}']
+  final [label = 'Complete cases for analysis\\n(No missing covariates)\\nn = {n_final_cc}', fillcolor = '#E2F0D9']
+  
+  # Exclusion nodes (Branching off to the right)
+  node [fillcolor = '#FCE4D6', width = 2.8]
+  excl_blood [label = 'Excluded: No blood test\\nn = {n_total - n_blood}']
+  excl_lpa   [label = 'Excluded: Missing Lp(a)\\nn = {n_blood - n_lpa}']
+  excl_age   [label = 'Excluded: Outside age 9-18\\nn = {n_lpa - n_age}']
+  excl_sex   [label = 'Excluded: Diverse/Missing sex\\nn = {n_age - n_sex}']
+  excl_cc    [label = 'Excluded: Missing lifestyle or BP data\\nn = {n_missing_covariates}']
+  
+  # Force horizontal alignment for exclusions
+  {{ rank = same; blood; excl_blood }}
+  {{ rank = same; lpa; excl_lpa }}
+  {{ rank = same; age; excl_age }}
+  {{ rank = same; sex; excl_sex }}
+  {{ rank = same; final; excl_cc }}
+  
+  # Draw vertical spine arrows
+  total -> blood
+  blood -> lpa
+  lpa -> age
+  age -> sex
+  sex -> final
+  
+  # Draw exclusion branch arrows
+  total -> excl_blood
+  blood -> excl_lpa
+  lpa -> excl_age
+  age -> excl_sex
+  sex -> excl_cc
+}}
+")
+
+# Render the graph
+flow_chart <- DiagrammeR::grViz(graph_text)
+flow_chart
+
+# Export the flowchart to a high-resolution PNG
+flow_chart %>%
+  DiagrammeRsvg::export_svg() %>%
+  charToRaw() %>%
+  rsvg::rsvg_png("flow_chart.png", width = 1500)
+
+cat("Exported flow_chart.png successfully!\n")
+```
+
+
+# Final Export
+
+```{r}
+have <- function(nm) exists(nm, envir = .GlobalEnv)
+
+lpa_pos <- df_reg %>% filter(blood_value_lpa > 0)
+
+# 1. Missingness & Mediation tables
+if (have("missing_summary")) {
+  ft_missing <- missing_summary %>%
+    filter(n_missing > 0) %>%
+    flextable() %>%
+    set_caption("Missingness by Variable (Analysis Sample)") %>%
+    autofit()
+}
+
+if (have("paths")) {
+  ft_mediation <- bind_rows(paths, .id = "Path") %>%
+    dplyr::select(Path, term, estimate, std.error, statistic, p.value) %>%
+    mutate(across(c(estimate, std.error, statistic), ~round(.x, 3)),
+           p.value = format.pval(as.numeric(p.value), digits = 3, eps = 0.001)) %>%
+    flextable() %>%
+    set_caption("Mediation Analysis Paths (Lifestyle -> BMI -> BP)") %>%
+    autofit()
+}
+
+# 2. Non-parametric test tables
+w_fh <- wilcox.test(blood_value_lpa ~ card_risk_fam_combined,
+                    data = lpa_pos %>% drop_na(card_risk_fam_combined))
+ft_wilcox_fh <- lpa_pos %>% drop_na(card_risk_fam_combined) %>% group_by(`Family history` = card_risk_fam_combined) %>%
+  summarise(N = n(), `Median (IQR)` = sprintf("%.1f (%.1f, %.1f)", median(blood_value_lpa), quantile(blood_value_lpa, .25), quantile(blood_value_lpa, .75)), .groups = "drop") %>%
+  flextable() %>% set_caption("Lp(a) by Family History of CVD (Wilcoxon rank-sum)") %>%
+  add_footer_lines(sprintf("W = %.0f, p = %s", w_fh$statistic, format.pval(w_fh$p.value, digits = 3, eps = 0.001))) %>% autofit()
+
+k_tier <- kruskal.test(blood_value_lpa ~ lifestyle_tier, data = lpa_pos)
+ft_kruskal_tier <- lpa_pos %>% drop_na(lifestyle_tier) %>% group_by(`Lifestyle tier` = lifestyle_tier) %>%
+  summarise(N = n(), `Median (IQR)` = sprintf("%.1f (%.1f, %.1f)", median(blood_value_lpa), quantile(blood_value_lpa, .25), quantile(blood_value_lpa, .75)), .groups = "drop") %>%
+  flextable() %>% set_caption("Lp(a) by Lifestyle Tier (Kruskal-Wallis)") %>%
+  add_footer_lines(sprintf("chi-squared = %.2f, df = %d, p = %s", k_tier$statistic, k_tier$parameter, format.pval(k_tier$p.value, digits = 3, eps = 0.001))) %>% autofit()
+
+pw <- pairwise.wilcox.test(lpa_pos$blood_value_lpa, lpa_pos$lifestyle_tier, p.adjust.method = "bonferroni")
+ft_pairwise <- as.data.frame(pw$p.value) %>% tibble::rownames_to_column("Group 1") %>% pivot_longer(-`Group 1`, names_to = "Group 2", values_to = "p_adj") %>% drop_na(p_adj) %>% mutate(`Adjusted p` = format.pval(p_adj, digits = 3, eps = 0.001)) %>% dplyr::select(`Group 1`, `Group 2`, `Adjusted p`) %>% flextable() %>% set_caption("Pairwise Lp(a) Comparisons Between Lifestyle Tiers (Bonferroni)") %>% autofit()
+
+make_anova_ft <- function(model_list, labels, cap) {
+  broom::tidy(do.call(anova, model_list)) %>% mutate(Model = labels) %>% dplyr::select(Model, df, `Sum Sq` = sumsq, `F` = statistic, `p-value` = p.value) %>%
+    mutate(`Sum Sq` = round(`Sum Sq`, 2), `F` = ifelse(is.na(`F`), "—", as.character(round(`F`, 2))), `p-value` = ifelse(is.na(`p-value`), "—", format.pval(`p-value`, digits = 3, eps = 0.001))) %>% flextable() %>% set_caption(cap) %>% autofit()
+}
+ft_anova_sys <- make_anova_ft(
+  list(m1_sys, m2_sys), 
+  c("M1: Base", "M2: + Lifestyle & Family Hx"), 
+  "Model Comparison - Systolic BP (nested F-test)"
+)
+ft_anova_dia <- make_anova_ft(
+  list(m1_dia, m2_dia), 
+  c("M1: Base", "M2: + Lifestyle & Family Hx"), 
+  "Model Comparison - Diastolic BP (nested F-test)"
+)
+
+# ALL Figures (Standard + Complex + Forest)
+figure_names <- c(
+  "Blood pressure by lifestyle score"      = "p_bp_lifestyle",
+  "Systolic BP by family history"          = "p_bp_famhist",
+  "BMI z-score vs Lp(a)"                   = "p_bmi_lpa",
+  "Lp(a) across age"                       = "p_lpa_age",
+  "Family history across age"              = "p_famhist_age",
+  "Blood pressure across age"              = "p_bp_age",
+  "Systolic BP across lifestyle score"     = "p_bp_score_scatter",
+  "Systolic BP vs BMI z-score"             = "p_bp_bmi",
+  "Log Lp(a) vs systolic BP"               = "p_lpa_bp",
+  "Density of log Lp(a) by family history" = "p_lpa_density_fh",
+  "Correlation matrix"                     = "p_corr",
+  "Systolic BP by lifestyle components"    = "p_bp_components",
+  "Lp(a) spread (whole dataset)"           = "p_lpa_spread_all",
+  "Lp(a) raw vs log distribution"          = "p_lpa_vs_log",
+  "Family history: whole vs analysis"      = "p_fh_compare",
+  "Lifestyle score spread"                 = "p_lifestyle_spread",
+  "Age: included vs excluded"              = "p_excl_age",
+  "BMI: included vs excluded"              = "p_excl_bmi",
+  "BP: included vs excluded"               = "p_excl_bp",
+  "Sex: included vs excluded"              = "p_excl_sex",
+  "Distribution of continuous variables"   = "p_hist_continuous",
+  "Distribution of categorical variables"  = "p_bar_categorical",
+  "Lp(a) vs continuous variables"          = "p_lpa_vs_continuous",
+  "Lp(a) vs categorical variables"         = "p_lpa_vs_categorical",
+  "Lp(a) developmental trajectory"         = "p_lpa_trajectory",
+  "Lp(a) distribution by sex"              = "p_lpa_density_sex",
+  "Lp(a) by family history (boxplot)"      = "p_lpa_famhist_box",
+  "Lp(a) by lifestyle tier"                = "p_lpa_tier",
+  "Spearman correlation heatmap"           = "p_spearman_heatmap",
+  "BMI z-score by sex"                     = "p_bmi_by_sex",
+  "BMI z-score vs Lp(a) (loess)"           = "p_bmi_vs_lpa",
+  "Coefficient plot (systolic models)"     = "p_coef_sys",
+  "Lifestyle x family history interaction" = "p_interaction",
+  "Elevated Lp(a) by lifestyle tier"       = "p_lpa_elevated_tier",
+  "Blood Pressure Across Age by Sex"       = "p_bp_age_sex",
+  "Lp(a) vs BP Split by Tier"              = "p_lpa_bp_tier",
+  "Raincloud: Systolic BP by Lifestyle"    = "p_bp_raincloud",
+  "Bubble Chart: Age, BP, Lp(a), Tier"     = "p_bubble",
+  "Pairs Plot (GGally)"                    = "p_pairs",
+  "Forest Plot: Binary BP Models"          = "p_forest_binary",
+  "Forest Plot: Multinomial BP Models"     = "p_forest_multi"
+)
+
+# ALL gtsummary tables
+gtsummary_tables <- c(
+  "Bias Check: Included vs Excluded"                 = "tab_bias",
+  "Table 1. Sample characteristics"                  = "table1",
+  "Table 2. By lifestyle tier"                       = "table2",
+  "Table 3. Main Effects Predictors of BP"           = "table3",
+  "Table 4. Lifestyle × Lp(a) Interaction"           = "table4",
+  "Table 5. Lifestyle × Family History Interaction"  = "table5",
+  "Table 6. Ordinal Percentile-Based BP"             = "table6"
+)
+
+# ALL Native flextable tables
+test_fts <- c(
+  "Missingness Summary"                            = "ft_missing",
+  "Mediation Paths"                                = "ft_mediation",
+  "Variance Inflation Factors"                     = "ft_vif",
+  "Joint Interaction Tests"                        = "ft_int_tests",
+  "Minimum Detectable Interaction Effects"         = "ft_mde",
+  "Sensitivity Analyses (ANOVA)"                   = "ft_sens_tests",
+  "Lp(a) by family history (Wilcoxon)"             = "ft_wilcox_fh",
+  "Lp(a) by lifestyle tier (Kruskal-Wallis)"       = "ft_kruskal_tier",
+  "Pairwise tier comparisons"                      = "ft_pairwise",
+  "Model comparison - systolic"                    = "ft_anova_sys",
+  "Model comparison - diastolic"                   = "ft_anova_dia",
+  "S1. Linear BP models (estimate + 95% CI)"       = "ft_supp_linear",
+  "S2. Composite-score models (estimate + 95% CI)" = "ft_supp_composite",
+  "S3. Composite vs components (nested F-test)"    = "ft_comp_vs_components"
+)
+
+missing_figs <- names(figure_names)[!vapply(figure_names, have, logical(1))]
+if (length(missing_figs)) warning("FIGURES NOT EXPORTED: ", paste(missing_figs, collapse = ", "))
+
+missing_gt <- names(gtsummary_tables)[!vapply(gtsummary_tables, have, logical(1))]
+if (length(missing_gt)) warning("GT TABLES NOT EXPORTED: ", paste(missing_gt, collapse = ", "))
+
+missing_ft <- names(test_fts)[!vapply(test_fts, have, logical(1))]
+if (length(missing_ft)) warning("FLEXTABLES NOT EXPORTED: ", paste(missing_ft, collapse = ", "))
+
+figure_names     <- figure_names[vapply(figure_names, have, logical(1))]
+gtsummary_tables <- gtsummary_tables[vapply(gtsummary_tables, have, logical(1))]
+test_fts         <- test_fts[vapply(test_fts, have, logical(1))]
+
+# Save figures as 300-dpi PNGs
+dir.create("figures", showWarnings = FALSE)
+fig_paths <- character(0)
+for (cap in names(figure_names)) {
+  path <- file.path("figures", paste0(gsub("[^A-Za-z0-9]+", "_", cap), ".png"))
+  ok <- try(ggsave(path, get(figure_names[[cap]]), width = 12, height = 6, dpi = 300, bg = "white"), silent = TRUE)
+  if (!inherits(ok, "try-error")) fig_paths[cap] <- path else warning("Figure failed: ", cap)
+}
+figure_names <- figure_names[names(fig_paths)]
+
+# Build the Word document
+doc <- read_docx()
+
+if (file.exists("flow_chart.png")) {
+  doc <- doc %>%
+    body_add_par("Participant Flow", style = "heading 1") %>%
+    body_add_img("flow_chart.png", width = 6, height = 6) %>%
+    body_add_par("", style = "Normal")
+}
+
+doc <- doc %>% body_add_par("Tables", style = "heading 1")
+for (cap in names(gtsummary_tables)) {
+  doc <- doc %>%
+    body_add_par(cap, style = "heading 2") %>%
+    body_add_flextable(as_flex_table(get(gtsummary_tables[[cap]]))) %>%
+    body_add_par("", style = "Normal")
+}
+
+doc <- doc %>% body_add_par("Supplementary & Test Tables", style = "heading 1")
+for (cap in names(test_fts)) {
+  doc <- doc %>%
+    body_add_par(cap, style = "heading 2") %>%
+    body_add_flextable(get(test_fts[[cap]])) %>%
+    body_add_par("", style = "Normal")
+}
+
+doc <- doc %>% body_add_par("Figures", style = "heading 1")
+for (cap in names(figure_names)) {
+  doc <- doc %>%
+    body_add_par(cap, style = "heading 2") %>%
+    body_add_img(fig_paths[cap], width = 7.5, height = 3.75) %>%
+    body_add_par("", style = "Normal")
+}
+
+print(doc, target = "manuscript_full.docx")
+
+# Save objects to regenerate later
+saveRDS(
+  list(
+    df    = df, 
+    df_reg = df_reg,
+    models = mget(ls(.GlobalEnv, pattern = "^m[0-9]|^m_|^sys_|^dia_"), envir = .GlobalEnv, ifnotfound = list(NA))
+  ), 
+  "analysis_objects.rds"
+)
+```
